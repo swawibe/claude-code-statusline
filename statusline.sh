@@ -15,7 +15,7 @@ input=$(cat)
 cwd=$(echo "$input" | jq -r '.workspace.current_dir // .cwd')
 model=$(echo "$input" | jq -r '.model.display_name // "Claude"')
 effort=$(echo "$input" | jq -r '.effort.level // empty')
-session_id=$(echo "$input" | jq -r '.session_id // empty')
+transcript=$(echo "$input" | jq -r '.transcript_path // empty')
 ctx_pct=$(echo "$input" | jq -r '.context_window.used_percentage // empty')
 ctx_tokens=$(echo "$input" | jq -r '.context_window.total_input_tokens // 0')
 ctx_max=$(echo "$input" | jq -r '.context_window.context_window_size // 200000')
@@ -36,40 +36,40 @@ if git -C "$cwd" rev-parse --git-dir >/dev/null 2>&1; then
     || git -C "$cwd" rev-parse --short HEAD 2>/dev/null)
 fi
 
-# The JSON only reports tokens for the current turn, so we keep the running
-# total ourselves, keyed by session_id. Cache-reads are excluded: they're the
-# prior context re-sent every turn, so counting them re-counts the same tokens.
-# Kept under ~/.claude (not /tmp) so it survives resumes days later.
-session_tokens=0
-if [ -n "$session_id" ]; then
-  call_total=$(echo "$input" | jq -r '
-    [.context_window.current_usage.input_tokens,
-     .context_window.current_usage.output_tokens,
-     .context_window.current_usage.cache_creation_input_tokens]
-    | map(. // 0) | add
-  ')
-
-  cache_dir="$HOME/.claude/statusline-token-cache"
-  mkdir -p "$cache_dir"
-  cache_file="${cache_dir}/${session_id}"
-  last_total=""
-  cumulative=0
-  if [ -f "$cache_file" ]; then
-    read -r last_total cumulative extra < "$cache_file" 2>/dev/null
-    # Reset if a concurrent write left the line torn (extra field / non-numeric).
-    if [ -n "$extra" ] || ! [ "$cumulative" -ge 0 ] 2>/dev/null; then
-      last_total=""
-      cumulative=0
-    fi
+# Whole-thread token total, read from Claude Code's local transcript (the same
+# ledger /usage and cost reports read). We sum every API response's usage,
+# deduped by message id, so it reflects the full thread across compaction and
+# --resume. The path comes from the payload (no hardcoded location); streaming
+# with `inputs` keeps memory flat regardless of transcript size. If the file is
+# absent or the format ever changes, jq yields nothing and the segment drops.
+session_tokens=""
+session_cache_reads=""
+if [ -n "$transcript" ] && [ -f "$transcript" ]; then
+  # Feed the main transcript plus any subagent transcripts
+  # (<session>/subagents/*.jsonl) so threads that spawned subagents aren't
+  # undercounted. Dedup is by message id, so extra files can't double-count; a
+  # missing subagents dir just leaves us with the main transcript.
+  files=("$transcript")
+  sub_dir="$(dirname "$transcript")/$(basename "$transcript" .jsonl)/subagents"
+  if [ -d "$sub_dir" ]; then
+    for f in "$sub_dir"/*.jsonl; do [ -f "$f" ] && files+=("$f"); done
   fi
-  # Only add when this is a new turn (the status line refreshes many times per
-  # turn on the same numbers). Write atomically so a refresh can't tear the file.
-  if [ "$call_total" != "$last_total" ] && [ "$call_total" -gt 0 ] 2>/dev/null; then
-    cumulative=$(( cumulative + call_total ))
-    tmp_file="${cache_file}.tmp.$$"
-    printf '%s %s\n' "$call_total" "$cumulative" > "$tmp_file" && mv -f "$tmp_file" "$cache_file"
-  fi
-  session_tokens=$cumulative
+  session_usage=$(jq -rn '
+    reduce inputs as $e ({};
+      if ($e.type == "assistant" and ($e.message.usage != null))
+      then .[$e.message.id // "anon"] = {
+             total: (($e.message.usage.input_tokens // 0)
+                     + ($e.message.usage.output_tokens // 0)
+                     + ($e.message.usage.cache_read_input_tokens // 0)
+                     + ($e.message.usage.cache_creation_input_tokens // 0)),
+             cache_reads: ($e.message.usage.cache_read_input_tokens // 0)
+           }
+      else . end)
+    | reduce .[] as $usage ({ total: 0, cache_reads: 0 };
+        .total += $usage.total | .cache_reads += $usage.cache_reads)
+    | [.total, .cache_reads] | @tsv
+  ' "${files[@]}" 2>/dev/null)
+  IFS=$'\t' read -r session_tokens session_cache_reads <<< "$session_usage"
 fi
 
 format_tokens() {
@@ -132,8 +132,8 @@ if [ -n "$ctx_pct" ]; then
   parts+=("${DIM}context${RESET} ${color}${bar}${RESET} ${color}${pct}%${RESET} ${DIM}$(format_tokens "$ctx_tokens")/$(format_tokens "$ctx_max")${RESET}")
 fi
 
-if [ "$session_tokens" -gt 0 ] 2>/dev/null; then
-  parts+=("${DIM}session${RESET} $(format_tokens "$session_tokens")")
+if [ -n "$session_tokens" ] && [ "$session_tokens" -gt 0 ] 2>/dev/null; then
+  parts+=("${DIM}session${RESET} $(format_tokens "$session_tokens") total ${DIM}·${RESET} $(format_tokens "$session_cache_reads") cache reads")
 fi
 
 if [ -n "$hour_pct" ]; then

@@ -70,7 +70,6 @@ sample='{"session_id":"install-smoke-test","model":{"display_name":"Sonnet"},"wo
 if [ -z "$(printf '%s' "$sample" | bash "$DEST")" ]; then
   die "smoke test produced no output; something is wrong"
 fi
-rm -f "$CLAUDE_DIR/statusline-token-cache/install-smoke-test"
 
 say ""
 say "Done. The status line appears after your next message in Claude Code."

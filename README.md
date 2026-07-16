@@ -5,7 +5,7 @@ model, reasoning effort, working directory, a context-window bar, and a running
 token count for the whole thread.
 
 ```
-Opus 4.8 (1M context) high │ ~/Documents/my-project │ context █░░░░░░░░░ 8% 81.0K/1.00M │ session 21.0K │ 5h 42% │ 7d 18%
+Opus 4.8 (1M context) high │ ~/Documents/my-project │ context █░░░░░░░░░ 8% 81.0K/1.00M │ session 1.20M total · 972.0K cache reads │ 5h 42% │ 7d 18%
 ```
 
 ## What it shows
@@ -19,7 +19,7 @@ Reading left to right:
 | path | `~/Documents/my-project` | Working directory, with your home folder shortened to `~`. |
 | branch | `main` | Current git branch. Shown only inside a git repo. |
 | context | `context █░░░░░░░░░ 8% 81.0K/1.00M` | How full the current context window is: bar, percent, and tokens-loaded / window-size. |
-| session | `session 21.0K` | Running token total for the whole thread. |
+| session | `session 1.20M total · 972.0K cache reads` | Whole-thread token total, with cache reads shown separately, read from Claude Code's local transcript. |
 | 5h / 7d | `5h 42% reset 8pm` `7d 18%` | Share of your rolling 5-hour / 7-day plan usage; the 5h segment also shows when the window resets. Pro/Max only. |
 
 The two token numbers (`context` and `session`) mean different things — see
@@ -40,6 +40,8 @@ The two token numbers (`context` and `session`) mean different things — see
 
 Claude Code v2.1.132 or newer is recommended: it's the version whose status-line
 JSON exposes the `context_window` and per-turn token fields this script reads.
+The `session` segment additionally reads the session transcript that Claude Code
+writes locally; if that isn't available it just omits that one segment.
 
 ## Install
 
@@ -113,17 +115,43 @@ The status line shows up after the next message. Nothing else to run.
 current window. It rises as you work and drops after `/compact`. The bar goes
 green → yellow at 70% → red at 90%.
 
-**`session`** is the running total for the whole thread. Claude Code's JSON only
-reports the current turn's tokens, so the script keeps the total itself in
-`~/.claude/statusline-token-cache/<session_id>`. It survives `/compact` and
-picks back up on `claude --resume`, even days later.
+**`session`** is the total tokens used across the whole thread — every token the
+API processed for this conversation, which is everything you're metered on. Its
+first number is explicitly the **total**; its second number is the **cache
+reads** included in that total. Cache writes are included in the total but not
+in cache reads.
 
-`session` counts each token once — new input, output, and cache-writes. It skips
-cache-reads on purpose: those are the earlier conversation re-sent on every turn,
-so counting them would tally the same tokens over and over. What's left is the
-unique work done on the thread, which is the number that actually tracks cost.
-It's a token count, not dollars — on a Pro/Max plan usage is included in the
-subscription, so a dollar figure wouldn't mean anything and isn't shown.
+Claude Code's status-line JSON only reports the current turn, so the script reads
+the session transcript at `transcript_path` (the local log Claude Code writes)
+and sums the usage of every API response, deduped by message id. It also folds in
+any subagent transcripts, so threads that delegated work aren't undercounted.
+Because the transcript is the durable ledger, this survives `/compact` and
+`claude --resume` automatically — no separate cache to maintain.
+
+It adds up all four billable token types:
+
+| Type | What it is |
+| --- | --- |
+| input | fresh tokens you send |
+| output | tokens the model generates |
+| cache write | new content written to the prompt cache |
+| cache read | cached context re-sent every turn (usually the bulk of the count) |
+
+All four are billed, so `session` is the honest **total billable tokens** for the
+thread. But it is **not** a dollar amount. The four types are priced very
+differently — output is the most expensive, and cache reads are ~90% *cheaper*
+than fresh input — so your actual bill is this count **re-weighted by per-type
+price**, not tokens times a flat rate. (That's why a thread can show tens of
+millions of tokens yet only a few dollars of cost: cache reads dominate the count
+but are cheap.) These are the same four types the Console bills under **Input /
+Prompt caching write / Prompt caching read / Output** — the Console shows their
+dollar cost; this segment shows their count, from the same ledger. For dollars,
+use `/usage` or the [Console](https://platform.claude.com/usage).
+
+`transcript_path` is a documented field, but the transcript's internal shape is
+not — so the read is best-effort: if the file is missing or its format ever
+changes, the `session` segment simply drops out and the rest of the line is
+unaffected.
 
 `5h` / `7d` only appear for Claude.ai Pro/Max accounts (the plan-usage fields
 aren't in the JSON otherwise). Any segment whose data is missing is dropped, so
