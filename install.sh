@@ -48,6 +48,31 @@ cp "$SRC" "$DEST"
 chmod +x "$DEST"
 say "Installed script -> $DEST"
 
+# Seed a commented config on first run only — never clobber one the user edited.
+CONF="$CLAUDE_DIR/statusline.conf"
+if [ -f "$CONF" ]; then
+  say "Kept your existing $CONF"
+else
+  cat > "$CONF" <<'CONF_EOF'
+# claude-code-statusline configuration. Plain shell, sourced by statusline.sh —
+# use VAR=value with no spaces around "=". Works for the CLI and the desktop app.
+# All settings are optional; the defaults are shown below.
+#
+# The cost shown is a USD list-price estimate. Anthropic bills in USD, so that
+# is the real billing currency — your card converts to local funds at its own
+# rate and fees, which no fixed number could match, so there is intentionally no
+# currency-conversion option. List prices also don't reflect account discounts.
+
+# Show the session cost estimate. 1 = show (default), 0 = hide (tokens only).
+#STATUSLINE_SHOW_COST=1
+
+# Color thresholds, in USD. At/below WARN is green; above WARN yellow; above CRIT red.
+#STATUSLINE_COST_WARN=50
+#STATUSLINE_COST_CRIT=100
+CONF_EOF
+  say "Wrote $CONF (all commented; edit to toggle cost / set thresholds)"
+fi
+
 CMD="bash $DEST"
 
 # Register in settings.json without disturbing anything else.
@@ -74,3 +99,4 @@ fi
 say ""
 say "Done. The status line appears after your next message in Claude Code."
 say "(Restart Claude Code if it's already running.)"
+say "Toggle the cost estimate and its thresholds in $CLAUDE_DIR/statusline.conf"

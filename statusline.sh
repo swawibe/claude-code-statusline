@@ -10,6 +10,28 @@ if ! command -v jq > /dev/null 2>&1; then
   exit 0
 fi
 
+# ── Cost display config ─────────────────────────────────────────────────────
+# The cost is a USD list-price estimate — Anthropic bills in USD, so that's the
+# real billing currency (your card does any conversion to local funds, at its
+# own rate + fees, which no fixed multiplier could match). It also uses public
+# list prices, so account-specific discounts or credits aren't reflected.
+#   STATUSLINE_SHOW_COST   1 = show the price (default), 0 = hide it (tokens only)
+#   STATUSLINE_COST_WARN   USD amount above which the price turns yellow
+#   STATUSLINE_COST_CRIT   USD amount above which it turns red. Defaults 50 / 100.
+#
+# Set these in ~/.claude/statusline.conf (a plain `VAR=value` file, sourced
+# below) — that works for both the CLI and the desktop app. Environment
+# variables also work but only reach the desktop app if set inside the
+# settings.json command; the config file avoids that. Override the config path
+# with STATUSLINE_CONF.
+_conf="${STATUSLINE_CONF:-${CLAUDE_CONFIG_DIR:-$HOME/.claude}/statusline.conf}"
+# shellcheck disable=SC1090
+[ -f "$_conf" ] && . "$_conf"
+
+: "${STATUSLINE_SHOW_COST:=1}"
+: "${STATUSLINE_COST_WARN:=50}"
+: "${STATUSLINE_COST_CRIT:=100}"
+
 input=$(cat)
 
 cwd=$(echo "$input" | jq -r '.workspace.current_dir // .cwd')
@@ -36,14 +58,19 @@ if git -C "$cwd" rev-parse --git-dir >/dev/null 2>&1; then
     || git -C "$cwd" rev-parse --short HEAD 2>/dev/null)
 fi
 
-# Whole-thread token total, read from Claude Code's local transcript (the same
-# ledger /usage and cost reports read). We sum every API response's usage,
-# deduped by message id, so it reflects the full thread across compaction and
-# --resume. The path comes from the payload (no hardcoded location); streaming
-# with `inputs` keeps memory flat regardless of transcript size. If the file is
-# absent or the format ever changes, jq yields nothing and the segment drops.
+# Whole-thread token total + cost estimate, read from Claude Code's local
+# transcript (the same ledger /usage and cost reports read). We sum every API
+# response's usage, deduped by message id, so it reflects the full thread across
+# compaction and --resume. Cost is priced per model family at base rates —
+# verified against real Console billing CSVs (Mar–Jul 2026) to ~0.3%: no
+# long-context premium, no discount. The live transcript is complete (never
+# purged), so the per-session estimate is accurate, not a rough guess. The path
+# comes from the payload (no hardcoded location); streaming with `inputs` keeps
+# memory flat regardless of transcript size. If the file is absent or the format
+# ever changes, jq yields nothing and the segment drops.
 session_tokens=""
 session_cache_reads=""
+session_cost=""
 if [ -n "$transcript" ] && [ -f "$transcript" ]; then
   # Feed the main transcript plus any subagent transcripts
   # (<session>/subagents/*.jsonl) so threads that spawned subagents aren't
@@ -54,22 +81,41 @@ if [ -n "$transcript" ] && [ -f "$transcript" ]; then
   if [ -d "$sub_dir" ]; then
     for f in "$sub_dir"/*.jsonl; do [ -f "$f" ] && files+=("$f"); done
   fi
+  # Rates are USD per million tokens: {input, output, cache_read, cache_write}.
+  # Keep in sync with claude-cost-report.py's PRICING table. Each family is
+  # matched explicitly; a model matching none (a future launch) is flagged
+  # unknown -> the price is suppressed for that render (tokens still shown),
+  # rather than guessing a wrong rate. Add the new family here to re-enable it.
   session_usage=$(jq -rn '
+    def rate($m):
+      ($m | ascii_downcase) as $l
+      | if   ($l | test("fable|mythos")) then {i:10, o:50, cr:1.00, cw:12.50, known:true}
+        elif ($l | test("opus"))         then {i:5,  o:25, cr:0.50, cw:6.25,  known:true}
+        elif ($l | test("sonnet"))       then {i:3,  o:15, cr:0.30, cw:3.75,  known:true}
+        elif ($l | test("haiku"))        then {i:1,  o:5,  cr:0.10, cw:1.25,  known:true}
+        else                                  {i:0,  o:0,  cr:0,    cw:0,     known:false} end;
     reduce inputs as $e ({};
       if ($e.type == "assistant" and ($e.message.usage != null))
-      then .[$e.message.id // "anon"] = {
-             total: (($e.message.usage.input_tokens // 0)
-                     + ($e.message.usage.output_tokens // 0)
-                     + ($e.message.usage.cache_read_input_tokens // 0)
-                     + ($e.message.usage.cache_creation_input_tokens // 0)),
-             cache_reads: ($e.message.usage.cache_read_input_tokens // 0)
-           }
+      then
+        ($e.message.usage) as $u
+        | (rate($e.message.model // "")) as $r
+        | (($u.input_tokens // 0)) as $in
+        | (($u.output_tokens // 0)) as $out
+        | (($u.cache_read_input_tokens // 0)) as $cr
+        | (($u.cache_creation_input_tokens // 0)) as $cw
+        | .[$e.message.id // "anon"] = {
+            total: ($in + $out + $cr + $cw),
+            cache_reads: $cr,
+            cost: (($in*$r.i + $out*$r.o + $cr*$r.cr + $cw*$r.cw) / 1000000),
+            unknown: (if $r.known then 0 else 1 end)
+          }
       else . end)
-    | reduce .[] as $usage ({ total: 0, cache_reads: 0 };
-        .total += $usage.total | .cache_reads += $usage.cache_reads)
-    | [.total, .cache_reads] | @tsv
+    | reduce .[] as $x ({ total: 0, cache_reads: 0, cost: 0, unknown: 0 };
+        .total += $x.total | .cache_reads += $x.cache_reads
+        | .cost += $x.cost | .unknown += $x.unknown)
+    | [.total, .cache_reads, .cost, (if .unknown > 0 then 1 else 0 end)] | @tsv
   ' "${files[@]}" 2>/dev/null)
-  IFS=$'\t' read -r session_tokens session_cache_reads <<< "$session_usage"
+  IFS=$'\t' read -r session_tokens session_cache_reads session_cost session_unknown <<< "$session_usage"
 fi
 
 format_tokens() {
@@ -81,6 +127,12 @@ format_tokens() {
   else
     printf '%s' "$n"
   fi
+}
+
+# Format a USD cost: "~US$45" at >= $10, "~US$4.30" below so small sessions
+# stay legible. "US$" disambiguates from CAD/AUD/etc.
+format_cost() {
+  awk -v c="$1" 'BEGIN { if (c >= 10) printf "~US$%.0f", c; else printf "~US$%.2f", c }'
 }
 
 # green < 70, yellow 70-89, red 90+
@@ -133,7 +185,20 @@ if [ -n "$ctx_pct" ]; then
 fi
 
 if [ -n "$session_tokens" ] && [ "$session_tokens" -gt 0 ] 2>/dev/null; then
-  parts+=("${DIM}session${RESET} $(format_tokens "$session_tokens") total ${DIM}·${RESET} $(format_tokens "$session_cache_reads") cache reads")
+  seg="${DIM}session${RESET}"
+  # Price first, threshold-colored (green / yellow above WARN / red above CRIT).
+  # Shown only when enabled, priceable, and every model was recognized — an
+  # unknown future model suppresses the price (tokens still show), never breaks.
+  if [ "$STATUSLINE_SHOW_COST" = "1" ] && [ -n "$session_cost" ] && [ "${session_unknown:-0}" != "1" ]; then
+    cost_int=$(printf '%.0f' "$session_cost" 2>/dev/null)
+    if   [ "$cost_int" -gt "$STATUSLINE_COST_CRIT" ] 2>/dev/null; then pcolor=$RED
+    elif [ "$cost_int" -gt "$STATUSLINE_COST_WARN" ] 2>/dev/null; then pcolor=$YELLOW
+    else                                                              pcolor=$GREEN
+    fi
+    seg="${seg} ${pcolor}$(format_cost "$session_cost")${RESET} ${DIM}·${RESET}"
+  fi
+  seg="${seg} $(format_tokens "$session_tokens") total ${DIM}·${RESET} $(format_tokens "$session_cache_reads") cache reads"
+  parts+=("$seg")
 fi
 
 if [ -n "$hour_pct" ]; then
