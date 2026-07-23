@@ -72,20 +72,24 @@ session_tokens=""
 session_cache_reads=""
 session_cost=""
 if [ -n "$transcript" ] && [ -f "$transcript" ]; then
-  # Feed the main transcript plus any subagent transcripts
-  # (<session>/subagents/*.jsonl) so threads that spawned subagents aren't
-  # undercounted. Dedup is by message id, so extra files can't double-count; a
-  # missing subagents dir just leaves us with the main transcript.
+  # Feed the main transcript plus every subagent transcript found anywhere
+  # under the session's own directory (<session>/**/*.jsonl), so nested or
+  # relocated subagent threads are never silently undercounted. Dedup is by
+  # message id, so extra files can't double-count; a missing dir just leaves us
+  # with the main transcript.
   files=("$transcript")
-  sub_dir="$(dirname "$transcript")/$(basename "$transcript" .jsonl)/subagents"
-  if [ -d "$sub_dir" ]; then
-    for f in "$sub_dir"/*.jsonl; do [ -f "$f" ] && files+=("$f"); done
+  session_dir="$(dirname "$transcript")/$(basename "$transcript" .jsonl)"
+  if [ -d "$session_dir" ]; then
+    while IFS= read -r f; do files+=("$f"); done \
+      < <(find "$session_dir" -type f -name '*.jsonl' 2>/dev/null)
   fi
   # Rates are USD per million tokens: {input, output, cache_read, cache_write}.
   # Keep in sync with claude-cost-report.py's PRICING table. Each family is
-  # matched explicitly; a model matching none (a future launch) is flagged
-  # unknown -> the price is suppressed for that render (tokens still shown),
-  # rather than guessing a wrong rate. Add the new family here to re-enable it.
+  # matched explicitly; a model matching none (a future launch) that carries
+  # real tokens is flagged unknown -> the price is suppressed for that render
+  # (tokens still shown), rather than guessing a wrong rate. Add the new family
+  # here to re-enable it. A zero-token turn (e.g. Claude Code's <synthetic>
+  # messages) is never flagged, so it can't blank the price.
   session_usage=$(jq -rn '
     def rate($m):
       ($m | ascii_downcase) as $l
@@ -107,7 +111,7 @@ if [ -n "$transcript" ] && [ -f "$transcript" ]; then
             total: ($in + $out + $cr + $cw),
             cache_reads: $cr,
             cost: (($in*$r.i + $out*$r.o + $cr*$r.cr + $cw*$r.cw) / 1000000),
-            unknown: (if $r.known then 0 else 1 end)
+            unknown: (if ($r.known or ($in + $out + $cr + $cw) == 0) then 0 else 1 end)
           }
       else . end)
     | reduce .[] as $x ({ total: 0, cache_reads: 0, cost: 0, unknown: 0 };
@@ -129,10 +133,10 @@ format_tokens() {
   fi
 }
 
-# Format a USD cost: "~US$45" at >= $10, "~US$4.30" below so small sessions
-# stay legible. "US$" disambiguates from CAD/AUD/etc.
+# Format a USD cost, always to 2 decimals: "~US$4.30", "~US$45.00".
+# "US$" disambiguates from CAD/AUD/etc.
 format_cost() {
-  awk -v c="$1" 'BEGIN { if (c >= 10) printf "~US$%.0f", c; else printf "~US$%.2f", c }'
+  awk -v c="$1" 'BEGIN { printf "~US$%.2f", c }'
 }
 
 # green < 70, yellow 70-89, red 90+
@@ -195,7 +199,8 @@ if [ -n "$session_tokens" ] && [ "$session_tokens" -gt 0 ] 2>/dev/null; then
     elif [ "$cost_int" -gt "$STATUSLINE_COST_WARN" ] 2>/dev/null; then pcolor=$YELLOW
     else                                                              pcolor=$GREEN
     fi
-    seg="${seg} ${pcolor}$(format_cost "$session_cost")${RESET} ${DIM}·${RESET}"
+    seg="${seg} ${pcolor}$(format_cost "$session_cost")${RESET}"
+    seg="${seg} ${DIM}·${RESET}"
   fi
   seg="${seg} $(format_tokens "$session_tokens") total ${DIM}·${RESET} $(format_tokens "$session_cache_reads") cache reads"
   parts+=("$seg")
